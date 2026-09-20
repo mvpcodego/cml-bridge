@@ -78,15 +78,50 @@ nav { margin-top: 30px; display: flex; gap: 18px; flex-wrap: wrap; font-size: .9
 .tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 0; }
 .tag { font-size: .8rem; border: 1px solid var(--line); border-radius: 100px; padding: 2px 10px; color: var(--muted); }
 @media (max-width: 560px) { .item { grid-template-columns: 1fr; } }
+
+/* Каталог карточками: осмыслен, когда приехали фотографии. Без них плитка
+   превращается в ряд пустых прямоугольников, поэтому есть и список. */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+        overflow: hidden; display: flex; flex-direction: column; }
+.card a { text-decoration: none; color: inherit; display: flex; flex-direction: column; height: 100%; }
+.card-img { aspect-ratio: 4 / 3; background: var(--bg); display: grid; place-items: center;
+            border-bottom: 1px solid var(--line); overflow: hidden; }
+.card-img img { width: 100%; height: 100%; object-fit: contain; }
+.card-img .noimg { color: var(--muted); font-size: .78rem; text-align: center; padding: 0 10px; }
+.card-body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 4px; flex: 1; }
+.card-name { font-size: .93rem; font-weight: 500; line-height: 1.35; }
+.card-art { font-family: var(--mono); font-size: .76rem; color: var(--muted); }
+.card-foot { margin-top: auto; display: flex; justify-content: space-between; align-items: baseline;
+             gap: 10px; padding-top: 8px; font-variant-numeric: tabular-nums; }
+.card-qty { font-size: .84rem; color: var(--muted); }
+.view { display: flex; gap: 10px; margin-left: auto; align-items: center; font-size: .9rem; }
+.view a { text-decoration: none; padding: 5px 12px; border: 1px solid var(--line);
+          border-radius: 100px; color: var(--muted); }
+.view a.on { border-color: var(--accent); color: var(--accent); }
 footer { margin-top: 46px; padding-top: 22px; border-top: 1px solid var(--line);
          color: var(--muted); font-size: .9rem; }
 """
+
+
+# Значок вкладки: две встречные стрелки — обмен данными. Встроен прямо
+# в страницу, чтобы не плодить файлы и не зависеть от статики.
+FAVICON = (
+    "data:image/svg+xml,"
+    "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
+    "%3Crect width='32' height='32' rx='7' fill='%231f6feb'/%3E"
+    "%3Cpath d='M8 12h13l-3.5-3.5M24 20H11l3.5 3.5' fill='none' stroke='white'"
+    " stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E"
+    "%3C/svg%3E"
+)
 
 
 def _page(title: str, body: str) -> str:
     return (
         "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"<link rel=\"icon\" href=\"{FAVICON}\">"
+        f"<meta name=\"color-scheme\" content=\"light dark\">"
         f"<title>{html.escape(title)}</title><style>{CSS}</style></head>"
         f"<body><div class=\"wrap\">{body}</div></body></html>"
     )
@@ -231,9 +266,42 @@ def _qty(value) -> str:
     return f"{value:,.0f}".replace(",", " ")
 
 
-def catalog(rows, total: int, query: str, offset: int, limit: int) -> str:
-    """Список товаров: то, что реально приехало из 1С."""
-    if rows:
+def _first_image(images: str) -> str | None:
+    for line in (images or "").split("\n"):
+        line = line.strip()
+        if line:
+            return line
+    return None
+
+
+def catalog(rows, total: int, query: str, offset: int, limit: int,
+            view: str = "list", has_image=None) -> str:
+    """Каталог: список или карточки. Карточки включаются вручную, потому что
+    без приехавших фотографий плитка выглядит как ряд пустых прямоугольников."""
+    if view == "cards" and rows:
+        cards = []
+        for r in rows:
+            rel = _first_image(r["images"])
+            if rel and has_image and has_image(rel):
+                pic = (f'<img src="/img/{urllib.parse.quote(rel)}" alt="" loading="lazy">')
+            elif rel:
+                pic = '<span class="noimg">фото не приехало<br>в архиве обмена</span>'
+            else:
+                pic = '<span class="noimg">фото нет в выгрузке</span>'
+            qty = r["qty_total"]
+            qty_cls = "card-qty zero" if (qty or 0) <= 0 else "card-qty"
+            art = f'<span class="card-art">{html.escape(r["article"])}</span>' if r["article"] else ""
+            cards.append(
+                f'<div class="card"><a href="/catalog/{html.escape(r["ident"])}">'
+                f'<span class="card-img">{pic}</span>'
+                f'<span class="card-body">'
+                f'<span class="card-name">{html.escape(r["name"] or r["ident"])}</span>{art}'
+                f'<span class="card-foot"><b>{_money(r["price_min"])}</b>'
+                f'<span class="{qty_cls}">{_qty(qty)} шт</span></span>'
+                f'</span></a></div>'
+            )
+        body_items = f'<div class="cards">{"".join(cards)}</div>'
+    elif rows:
         items = []
         for r in rows:
             qty = r["qty_total"]
@@ -252,6 +320,8 @@ def catalog(rows, total: int, query: str, offset: int, limit: int) -> str:
 
     pager = []
     q = f"&q={urllib.parse.quote(query)}" if query else ""
+    q_link = f"&q={urllib.parse.quote(query)}" if query else ""
+    q = q + (f"&view={view}" if view == "cards" else "")
     if offset > 0:
         pager.append(f'<a href="/catalog?offset={max(0, offset - limit)}{q}">← назад</a>')
     if offset + limit < total:
@@ -268,9 +338,15 @@ def catalog(rows, total: int, query: str, offset: int, limit: int) -> str:
 </header>
 
 <form class="search" method="get" action="/catalog">
-  <input type="search" name="q" value="{html.escape(query)}" placeholder="Название или артикул" autofocus>
+  <input type="search" name="q" value="{html.escape(query)}" placeholder="Название или артикул">
+  <input type="hidden" name="view" value="{html.escape(view)}">
   <button type="submit">Найти</button>
 </form>
+
+<div class="view">
+  <a href="/catalog?view=list{q_link}" class="{'on' if view != 'cards' else ''}">списком</a>
+  <a href="/catalog?view=cards{q_link}" class="{'on' if view == 'cards' else ''}">карточками</a>
+</div>
 
 {body_items}
 <div class="pager">{" ".join(pager)}</div>
@@ -281,7 +357,7 @@ def catalog(rows, total: int, query: str, offset: int, limit: int) -> str:
     return _page("Каталог из 1С", body)
 
 
-def product(row, offers, stock, group_names) -> str:
+def product(row, offers, stock, group_names, has_image=None) -> str:
     """Карточка позиции: свойства из 1С, предложения, остатки по складам."""
     by_offer: dict[str, list] = {}
     for s in stock:
@@ -329,8 +405,22 @@ def product(row, offers, stock, group_names) -> str:
     images = [i for i in (row["images"] or "").split("\n") if i.strip()]
     img_html = ""
     if images:
+        shown = []
+        for rel in images:
+            if has_image and has_image(rel):
+                shown.append(
+                    '<span class="card-img" style="max-width:260px;border-radius:10px;'
+                    'border:1px solid var(--line)">'
+                    f'<img src="/img/{urllib.parse.quote(rel)}" alt="" loading="lazy"></span>'
+                )
         chips = "".join(f'<span class="tag">{html.escape(i)}</span>' for i in images)
-        img_html = f'<h2>Файлы изображений</h2><div class="panel"><div class="tags">{chips}</div></div>'
+        gallery = ('<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">'
+                   f'{"".join(shown)}</div>') if shown else ""
+        note = "" if shown else (
+            '<p class="muted" style="margin:0 0 10px">Файлы не приехали в архиве обмена — '
+            'в выгрузке есть только пути к ним.</p>')
+        img_html = (f'<h2>Фотографии</h2><div class="panel">{gallery}{note}'
+                    f'<div class="tags">{chips}</div></div>')
 
     groups_html = ""
     if group_names:

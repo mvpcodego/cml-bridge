@@ -185,6 +185,32 @@ def run() -> int:
     status, body = client._open(f"{base}/catalog/" + urllib.parse.quote("нет-такого"))
     check("несуществующая позиция даёт 404", status == 404)
 
+    print("\n10. Архив обмена с картинками")
+    import io, zipfile
+    # 1x1 PNG — минимальная валидная картинка
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+        "890000000a49444154789c6300010000050001"
+        "0d0a2db40000000049454e44ae426082"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("import.xml", open(os.path.join(FIXTURES, "import.xml"), "rb").read())
+        zf.writestr("import_files/aa/photo.jpg", png)
+    client.post_file("exchange.zip", buf.getvalue())
+    status, body = client.get("type=catalog&mode=import&filename=exchange.zip")
+    zip_res = body.decode("cp1251")
+    check("архив распакован, XML обработан", zip_res.startswith("success") and "exchange.zip" in zip_res, zip_res[:110])
+    check("идемпотентность работает и внутри архива", "уже применялся" in zip_res, zip_res[:110])
+    status, body = client._open(f"{base}/img/import_files/aa/photo.jpg")
+    check("картинка из архива отдаётся", status == 200 and body[:4] == b"\x89PNG", str(status))
+    status, body = client._open(f"{base}/img/import_files/aa/" + urllib.parse.quote("нет.jpg"))
+    check("отсутствующая картинка даёт 404", status == 404)
+    status, body = client._open(f"{base}/img/../../etc/passwd")
+    check("выход за пределы хранилища закрыт", status in (404, 400), str(status))
+    status, body = client.get("type=catalog&mode=init")
+    check("init теперь разрешает архивы", "zip=yes" in body.decode("cp1251"))
+
     httpd.shutdown()
     shutil.rmtree(tmp, ignore_errors=True)
 

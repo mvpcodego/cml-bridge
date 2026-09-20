@@ -82,9 +82,10 @@ class Exchange:
     def init(self, kind: str) -> str:
         session_id = self.store.start_session(kind)
         self.sessions[kind] = session_id
-        # zip=no — принимаем несжатые XML (архив тоже поддержан в handle_file);
-        # file_limit — размер части, которую 1С пришлёт одним POST.
-        return "zip=no\nfile_limit=10485760"
+        # zip=yes — 1С шлёт архив: внутри и XML, и картинки товаров
+        # (в XML лежат только пути вида import_files/xx/yy.jpg, сами файлы
+        # приезжают в этом же архиве). file_limit — размер части одного POST.
+        return "zip=yes\nfile_limit=10485760"
 
     def _spool_path(self, filename: str) -> str:
         safe = os.path.basename(filename or "part.xml").replace("\\", "_")
@@ -98,12 +99,70 @@ class Exchange:
             fh.write(chunk)
         return "success"
 
+    def unpack_archive(self, path: str) -> list[str]:
+        """Распаковать архив обмена: XML в очередь, картинки — в хранилище.
+
+        Картинки лежат внутри того же архива, что и XML, по путям, на которые
+        ссылается каталог (`import_files/...`). Если их не сохранить, товары
+        останутся без фотографий, а в XML будут ссылки в никуда.
+        """
+        import zipfile
+
+        xmls: list[str] = []
+        images_root = os.path.join(self.spool, "images")
+        os.makedirs(images_root, exist_ok=True)
+        with zipfile.ZipFile(path) as zf:
+            for member in zf.infolist():
+                if member.is_dir():
+                    continue
+                name = member.filename.replace("\\", "/")
+                low = name.lower()
+                if low.endswith(".xml"):
+                    target = os.path.join(self.spool, os.path.basename(name))
+                    with zf.open(member) as src, open(target, "wb") as dst:
+                        dst.write(src.read())
+                    xmls.append(os.path.basename(name))
+                elif low.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+                    # Путь сохраняем как есть — по нему на картинку ссылается XML.
+                    safe = "/".join(
+                        part for part in name.split("/") if part not in ("", ".", "..")
+                    )
+                    target = os.path.join(images_root, safe)
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with zf.open(member) as src, open(target, "wb") as dst:
+                        dst.write(src.read())
+        return xmls
+
+    def image_path(self, rel: str) -> str | None:
+        """Абсолютный путь к картинке по ссылке из XML, если файл приехал."""
+        rel = rel.replace("\\", "/").strip().lstrip("/")
+        safe = "/".join(part for part in rel.split("/") if part not in ("", ".", ".."))
+        if not safe:
+            return None
+        full = os.path.join(self.spool, "images", safe)
+        root = os.path.realpath(os.path.join(self.spool, "images"))
+        if not os.path.realpath(full).startswith(root):
+            return None
+        return full if os.path.isfile(full) else None
+
     def handle_import(self, filename: str, kind: str = "catalog") -> str:
         path = self._spool_path(filename)
         if not os.path.exists(path):
             return f"failure\nФайл {filename} не найден в очереди"
         raw = open(path, "rb").read()
         digest = hashlib.sha256(raw).hexdigest()
+
+        # Архив: внутри XML и картинки. Распаковываем и импортируем все XML.
+        if raw[:2] == b"PK":
+            try:
+                names = self.unpack_archive(path)
+            except Exception as exc:
+                return f"failure\nНе смог распаковать {filename}: {exc}"
+            if not names:
+                return f"failure\nВ архиве {filename} нет XML"
+            results = [self.handle_import(name, kind) for name in names]
+            body = "; ".join(r.replace("success\n", "") for r in results)
+            return f"success\n{filename}: {body}"
         session_id = self.sessions.get(kind) or self.store.start_session(kind)
         self.sessions[kind] = session_id
 
@@ -195,7 +254,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 offset = 0
             rows, total = ex.store.search_products(query, limit, offset)
-            page = web.catalog(rows, total, query, offset, limit)
+            view = "cards" if params.get("view") == "cards" else "list"
+            page = web.catalog(rows, total, query, offset, limit, view,
+                               has_image=lambda rel: ex.image_path(rel) is not None)
             return self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
         if path.startswith("/catalog/"):
             ident = urllib.parse.unquote(path[len("/catalog/"):])
@@ -203,8 +264,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if row is None:
                 return self._send("failure\nПозиция не найдена", 404)
             groups = ex.store.group_names([g for g in (row["groups"] or "").split(",") if g])
-            page = web.product(row, offers, stock, groups)
+            page = web.product(row, offers, stock, groups,
+                               has_image=lambda rel: ex.image_path(rel) is not None)
             return self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
+        if path.startswith("/img/"):
+            rel = urllib.parse.unquote(path[len("/img/"):])
+            full = ex.image_path(rel)
+            if not full:
+                return self._send("failure\nКартинка не приехала", 404)
+            ctype = {
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                ".webp": "image/webp", ".gif": "image/gif",
+            }.get(os.path.splitext(full)[1].lower(), "application/octet-stream")
+            with open(full, "rb") as fh:
+                data = fh.read()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return None
         if path == "/report.txt":
             return self._send(reconcile.render_text(reconcile.build(ex.store)))
 
