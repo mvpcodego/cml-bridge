@@ -167,23 +167,48 @@ def run() -> int:
     text = reconcile.render_text(rep)
     check("отчёт читаемый и с итогами", "СВЕРКА КАТАЛОГА" in text and "В базе:" in text)
 
-    print("\n9. Страницы каталога")
-    status, body = client._open(f"{base}/catalog")
-    page = body.decode("utf-8")
-    check("каталог открывается", status == 200 and "Каталог из 1С" in page)
-    check("в каталоге есть позиции", "/catalog/" in page, page[:120])
-    status, body = client._open(f"{base}/catalog?q=" + urllib.parse.quote("ботинки"))
-    found = body.decode("utf-8")
-    check("поиск по названию работает", status == 200 and "Ботинки" in found)
-    status, body = client._open(f"{base}/catalog?q=" + urllib.parse.quote("Б-130005"))
-    by_art = body.decode("utf-8")
-    check("поиск находит артикул с пробелом внутри", "130005" in by_art, by_art[:160])
-    row = store.conn.execute("SELECT ident FROM products WHERE article<>'' LIMIT 1").fetchone()
-    status, body = client._open(f"{base}/catalog/" + urllib.parse.quote(row["ident"]))
-    card = body.decode("utf-8")
-    check("карточка позиции открывается", status == 200 and "Предложения и остатки" in card)
-    status, body = client._open(f"{base}/catalog/" + urllib.parse.quote("нет-такого"))
+    print("\n9. Данные для сайта (API) и редирект человека")
+    import json as _json
+    status, body = client._open(f"{base}/api/state")
+    state = _json.loads(body.decode("utf-8"))
+    check("api/state отдаёт счётчики", status == 200 and state["counts"]["products"] > 0, str(status))
+    status, body = client._open(f"{base}/api/catalog?limit=3")
+    cat = _json.loads(body.decode("utf-8"))
+    check("api/catalog отдаёт товары", status == 200 and len(cat["items"]) == 3 and cat["total"] > 3)
+    q = urllib.parse.quote("ботинки")
+    status, body = client._open(f"{base}/api/catalog?q={q}")
+    found = _json.loads(body.decode("utf-8"))
+    check("поиск по-русски работает через api", found["total"] > 0, str(found["total"]))
+    q2 = urllib.parse.quote("Б-130005")
+    status, body = client._open(f"{base}/api/catalog?q={q2}")
+    by_art = _json.loads(body.decode("utf-8"))
+    check("артикул с пробелом внутри находится", by_art["total"] > 0, str(by_art["total"]))
+    ident = cat["items"][0]["ident"]
+    status, body = client._open(f"{base}/api/product/{urllib.parse.quote(ident)}")
+    prod = _json.loads(body.decode("utf-8"))
+    check("api/product отдаёт позицию", status == 200 and prod["ident"] == ident)
+    status, body = client._open(f"{base}/api/product/" + urllib.parse.quote("нет-такого"))
     check("несуществующая позиция даёт 404", status == 404)
+    status, body = client._open(f"{base}/api/report")
+    rep_json = _json.loads(body.decode("utf-8"))
+    check("api/report отдаёт находки", status == 200 and rep_json["problems"] > 0)
+    codes = {f["code"] for f in rep_json["findings"]}
+    check("среди находок есть дубли артикулов", "dup_article" in codes, str(sorted(codes)))
+
+    print("\n9б. Человек уходит на сайт")
+    import urllib.request as _ur
+    class NoRedirect(_ur.HTTPRedirectHandler):
+        def redirect_request(self, *a, **kw):
+            return None
+    opener = _ur.build_opener(NoRedirect)
+    for p_ in ("/", "/catalog", "/report"):
+        try:
+            opener.open(base + p_, timeout=10)
+            code = 200
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+            loc = exc.headers.get("Location", "")
+        check(f"{p_} отправляет на сайт", code == 302 and "mvp-code.ru/1c" in loc, f"{code} {loc}")
 
     print("\n10. Архив обмена с картинками")
     import io, zipfile

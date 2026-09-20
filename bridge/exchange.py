@@ -33,9 +33,11 @@ import secrets
 import urllib.parse
 from typing import Callable
 
-from . import cml, orders as orders_mod, reconcile, store as store_mod, web
+from . import cml, orders as orders_mod, reconcile, store as store_mod
 
 RESPONSE_ENCODING = "windows-1251"
+# Куда отправлять человека, попавшего на служебный адрес обмена
+SITE_URL = os.environ.get("CML_SITE_URL", "https://mvp-code.ru/1c")
 COOKIE_NAME = "cml_session"
 
 
@@ -237,36 +239,117 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         params = self._params()
 
-        if path == "/":
-            page = web.index(ex.store.counts(), ex.store.last_session("catalog"),
-                             self.headers.get("Host", "1c.mvp-code.ru").split(":")[0])
-            return self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
+        # Страницы для человека живут на сайте mvp-code.ru/1c — там общая шапка,
+        # подвал и переключатель языков. Здесь остались только обмен для 1С,
+        # выдача данных сайту и раздача картинок.
+        if path in ("/", "/catalog", "/report", "/report.txt") or path.startswith("/catalog/"):
+            self.send_response(302)
+            self.send_header("Location", SITE_URL)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
         if path == "/health":
             return self._send("ok")
-        if path == "/report":
-            page = web.report(reconcile.build(ex.store))
-            return self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
-        if path == "/catalog":
-            query = params.get("q", "")
-            limit = 50
-            try:
-                offset = max(0, int(params.get("offset", "0")))
-            except ValueError:
-                offset = 0
-            rows, total = ex.store.search_products(query, limit, offset)
-            view = "cards" if params.get("view") == "cards" else "list"
-            page = web.catalog(rows, total, query, offset, limit, view,
-                               has_image=lambda rel: ex.image_path(rel) is not None)
-            return self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
-        if path.startswith("/catalog/"):
-            ident = urllib.parse.unquote(path[len("/catalog/"):])
-            row, offers, stock = ex.store.product(ident)
-            if row is None:
-                return self._send("failure\nПозиция не найдена", 404)
-            groups = ex.store.group_names([g for g in (row["groups"] or "").split(",") if g])
-            page = web.product(row, offers, stock, groups,
-                               has_image=lambda rel: ex.image_path(rel) is not None)
-            return self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
+        if path.startswith("/api/"):
+            import json as _json
+
+            def out(payload, code=200):
+                data = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                # Данные забирает сайт mvp-code.ru — отдаём их открыто:
+                # это демонстрационный контур, секретов в каталоге нет.
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "public, max-age=60")
+                self.end_headers()
+                self.wfile.write(data)
+
+            if path == "/api/state":
+                last = ex.store.last_session("catalog")
+                return out({
+                    "counts": ex.store.counts(),
+                    "last": (dict(last) if last is not None else None),
+                })
+
+            if path == "/api/catalog":
+                query = params.get("q", "")
+                try:
+                    limit = min(200, max(1, int(params.get("limit", "50"))))
+                    offset = max(0, int(params.get("offset", "0")))
+                except ValueError:
+                    limit, offset = 50, 0
+                rows, total = ex.store.search_products(query, limit, offset)
+                items = []
+                for r in rows:
+                    rel = next((i for i in (r["images"] or "").split("\n") if i.strip()), None)
+                    items.append({
+                        "ident": r["ident"], "name": r["name"], "article": r["article"],
+                        "price": r["price_min"], "quantity": r["qty_total"],
+                        "offers": r["offers_count"],
+                        "image": ("/img/" + urllib.parse.quote(rel)) if (rel and ex.image_path(rel)) else None,
+                        "image_declared": bool(rel),
+                    })
+                return out({"total": total, "offset": offset, "limit": limit, "items": items})
+
+            if path.startswith("/api/product/"):
+                ident = urllib.parse.unquote(path[len("/api/product/"):])
+                row, offers, stock = ex.store.product(ident)
+                if row is None:
+                    return out({"error": "not found"}, 404)
+                by_offer: dict = {}
+                for st in stock:
+                    by_offer.setdefault(st["offer_ident"], []).append(
+                        {"warehouse": st["warehouse"], "quantity": st["quantity"]}
+                    )
+                props = {}
+                for line in (row["props"] or "").split("\n"):
+                    if "=" in line:
+                        k, _, v = line.partition("=")
+                        props[k] = v
+                images = []
+                for rel in (row["images"] or "").split("\n"):
+                    rel = rel.strip()
+                    if not rel:
+                        continue
+                    images.append({
+                        "path": rel,
+                        "url": ("/img/" + urllib.parse.quote(rel)) if ex.image_path(rel) else None,
+                    })
+                return out({
+                    "ident": row["ident"], "name": row["name"], "article": row["article"],
+                    "groups": ex.store.group_names(
+                        [g for g in (row["groups"] or "").split(",") if g]
+                    ),
+                    "props": props, "images": images,
+                    "offers": [
+                        {
+                            "ident": o["ident"], "name": o["name"], "price": o["price"],
+                            "currency": o["currency"], "quantity": o["quantity"],
+                            "features": dict(
+                                line.split("=", 1) for line in (o["features"] or "").split("\n")
+                                if "=" in line
+                            ),
+                            "stock": by_offer.get(o["ident"], []),
+                        }
+                        for o in offers
+                    ],
+                })
+
+            if path == "/api/report":
+                rep = reconcile.build(ex.store)
+                return out({
+                    "totals": rep.totals,
+                    "problems": rep.problems,
+                    "findings": [
+                        {"code": f.code, "title": f.title, "count": f.count,
+                         "samples": f.samples, "hint": f.hint}
+                        for f in rep.findings
+                    ],
+                })
+
+            return out({"error": "unknown endpoint"}, 404)
+
         if path.startswith("/img/"):
             rel = urllib.parse.unquote(path[len("/img/"):])
             full = ex.image_path(rel)
@@ -318,9 +401,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         Без этого обработчика базовый класс отвечает 501, и снаружи сервис
         выглядит нерабочим при живом GET."""
         path = urllib.parse.urlparse(self.path).path
-        status = 200 if (path in ("/", "/health", "/report", "/report.txt", "/catalog",
-                                  "/exchange", "/bitrix/admin/1c_exchange.php")
-                         or path.startswith("/catalog/")) else 404
+        status = 200 if (path in ("/health", "/exchange", "/bitrix/admin/1c_exchange.php")
+                         or path.startswith(("/api/", "/img/"))) else 404
         self.send_response(status)
         self.send_header("Content-Type", f"text/plain; charset={RESPONSE_ENCODING}")
         self.send_header("Content-Length", "0")
