@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -165,6 +166,24 @@ def run() -> int:
     check("сверка нашла позиции без фото", "no_image" in codes, str(sorted(codes)))
     text = reconcile.render_text(rep)
     check("отчёт читаемый и с итогами", "СВЕРКА КАТАЛОГА" in text and "В базе:" in text)
+
+    print("\n9. Страницы каталога")
+    status, body = client._open(f"{base}/catalog")
+    page = body.decode("utf-8")
+    check("каталог открывается", status == 200 and "Каталог из 1С" in page)
+    check("в каталоге есть позиции", "/catalog/" in page, page[:120])
+    status, body = client._open(f"{base}/catalog?q=" + urllib.parse.quote("ботинки"))
+    found = body.decode("utf-8")
+    check("поиск по названию работает", status == 200 and "Ботинки" in found)
+    status, body = client._open(f"{base}/catalog?q=" + urllib.parse.quote("Б-130005"))
+    by_art = body.decode("utf-8")
+    check("поиск находит артикул с пробелом внутри", "130005" in by_art, by_art[:160])
+    row = store.conn.execute("SELECT ident FROM products WHERE article<>'' LIMIT 1").fetchone()
+    status, body = client._open(f"{base}/catalog/" + urllib.parse.quote(row["ident"]))
+    card = body.decode("utf-8")
+    check("карточка позиции открывается", status == 200 and "Предложения и остатки" in card)
+    status, body = client._open(f"{base}/catalog/" + urllib.parse.quote("нет-такого"))
+    check("несуществующая позиция даёт 404", status == 404)
 
     httpd.shutdown()
     shutil.rmtree(tmp, ignore_errors=True)

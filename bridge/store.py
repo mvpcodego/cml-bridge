@@ -135,6 +135,11 @@ class Store:
         self.lock = threading.Lock()
         self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self.conn.row_factory = sqlite3.Row
+        # Встроенный lower() в SQLite приводит к нижнему регистру ТОЛЬКО латиницу:
+        # поиск по «ботинки» не найдёт «Ботинки». Для русского каталога это
+        # означает, что поиск просто не работает — без ошибки, просто пустой
+        # результат. Поэтому регистр приводим средствами Python.
+        self.conn.create_function("rulower", 1, lambda v: v.lower() if isinstance(v, str) else v)
         # WAL — чтобы чтение отчёта не блокировалось идущим обменом.
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
@@ -271,6 +276,61 @@ class Store:
         for table in ("groups", "products", "offers", "stock", "sessions"):
             out[table] = self.conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
         return out
+
+    # --- витрина каталога (для человека) --------------------------------
+    def search_products(self, query: str = "", limit: int = 50, offset: int = 0):
+        """Список товаров с ценой и остатком. Поиск по названию и артикулу,
+        причём артикул ищется по нормализованному ключу — чтобы «Б-130005»
+        находил и позицию, записанную как «Б- 130005»."""
+        params: list = []
+        where = ""
+        if query.strip():
+            q = f"%{query.strip().lower()}%"
+            key = normalize_article(query)
+            where = ("WHERE rulower(p.name) LIKE ? OR rulower(p.article) LIKE ? "
+                     "OR p.article_key LIKE ?")
+            params += [q, q, f"%{key}%"]
+        sql = f"""
+            SELECT p.ident, p.name, p.article, p.images, p.deleted,
+                   (SELECT COUNT(*) FROM offers o WHERE o.product_ident = p.ident) AS offers_count,
+                   (SELECT MIN(o.price) FROM offers o
+                     WHERE o.product_ident = p.ident AND o.price IS NOT NULL) AS price_min,
+                   (SELECT SUM(COALESCE(st.q, o.quantity, 0)) FROM offers o
+                      LEFT JOIN (SELECT offer_ident, SUM(quantity) q FROM stock GROUP BY offer_ident) st
+                        ON st.offer_ident = o.ident
+                     WHERE o.product_ident = p.ident) AS qty_total
+            FROM products p
+            {where}
+            ORDER BY p.name
+            LIMIT ? OFFSET ?
+        """
+        rows = self.conn.execute(sql, params + [limit, offset]).fetchall()
+        total = self.conn.execute(
+            f"SELECT COUNT(*) c FROM products p {where}", params
+        ).fetchone()["c"]
+        return rows, total
+
+    def product(self, ident: str):
+        row = self.conn.execute("SELECT * FROM products WHERE ident=?", (ident,)).fetchone()
+        if row is None:
+            return None, [], []
+        offers = self.conn.execute(
+            "SELECT * FROM offers WHERE product_ident=? ORDER BY name", (ident,)
+        ).fetchall()
+        stock = self.conn.execute(
+            "SELECT s.offer_ident, s.warehouse, s.quantity FROM stock s "
+            "JOIN offers o ON o.ident = s.offer_ident WHERE o.product_ident=?", (ident,)
+        ).fetchall()
+        return row, offers, stock
+
+    def group_names(self, idents: list[str]) -> list[str]:
+        if not idents:
+            return []
+        marks = ",".join("?" * len(idents))
+        rows = self.conn.execute(
+            f"SELECT name FROM groups WHERE ident IN ({marks})", idents
+        ).fetchall()
+        return [r["name"] for r in rows]
 
     def last_session(self, kind: str = "catalog"):
         return self.conn.execute(

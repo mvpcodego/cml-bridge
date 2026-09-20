@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import time
+import urllib.parse
 
 CSS = """
 *, *::before, *::after { box-sizing: border-box; }
@@ -58,6 +59,25 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 .ok-box { border-left: 3px solid var(--ok); padding-left: 16px; }
 a { color: var(--accent); }
 nav { margin-top: 30px; display: flex; gap: 18px; flex-wrap: wrap; font-size: .94rem; }
+
+.search { display: flex; gap: 10px; margin: 0 0 20px; }
+.search input { flex: 1; min-width: 0; padding: 11px 14px; font: inherit;
+  background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 9px; }
+.search button { padding: 11px 20px; font: inherit; cursor: pointer; border-radius: 9px;
+  border: 1px solid var(--accent); background: var(--accent); color: #fff; }
+.items { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--panel); }
+.item { display: grid; grid-template-columns: 1fr auto auto; gap: 8px 20px;
+        padding: 13px 18px; border-bottom: 1px solid var(--line); align-items: baseline; }
+.item:last-child { border-bottom: 0; }
+.item a { text-decoration: none; font-weight: 500; }
+.item .art { display: block; font-family: var(--mono); font-size: .82rem; color: var(--muted); margin-top: 2px; }
+.item .price, .item .qty { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.item .qty { color: var(--muted); font-size: .9rem; }
+.zero { color: var(--warn); }
+.pager { display: flex; gap: 14px; margin: 20px 0 0; align-items: center; }
+.tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 0; }
+.tag { font-size: .8rem; border: 1px solid var(--line); border-radius: 100px; padding: 2px 10px; color: var(--muted); }
+@media (max-width: 560px) { .item { grid-template-columns: 1fr; } }
 footer { margin-top: 46px; padding-top: 22px; border-top: 1px solid var(--line);
          color: var(--muted); font-size: .9rem; }
 """
@@ -123,6 +143,13 @@ def index(counts: dict, last_session, host: str) -> str:
 <h2>Последний обмен</h2>
 <div class="panel">{last_html}</div>
 
+<h2>Каталог</h2>
+<div class="panel">
+  <p style="margin:0 0 10px">Товары, которые приехали обменом: названия, артикулы,
+  цены и остатки по складам. Поиск по названию и артикулу.</p>
+  <a href="/catalog">Открыть каталог →</a>
+</div>
+
 <h2>Сверка</h2>
 <div class="panel">
   <p style="margin:0 0 10px">Отвечает на вопрос, которого нет в сообщении «обмен прошёл
@@ -132,6 +159,7 @@ def index(counts: dict, last_session, host: str) -> str:
 </div>
 
 <nav>
+  <a href="/catalog">Каталог</a>
   <a href="https://github.com/mvpcodego/cml-bridge">Исходный код и разбор граблей обмена</a>
   <a href="/report.txt">Отчёт текстом</a>
 </nav>
@@ -185,7 +213,144 @@ def report(rep) -> str:
 <h2>Находки</h2>
 {blocks}
 
-<nav><a href="/">← На главную</a><a href="/report.txt">Тот же отчёт текстом</a></nav>
+<nav><a href="/">← На главную</a><a href="/catalog">Каталог</a><a href="/report.txt">Тот же отчёт текстом</a></nav>
 <footer>Павел Чертинов · <a href="https://mvp-code.ru">mvp-code.ru</a></footer>
 """
     return _page("Сверка каталога", body)
+
+
+def _money(value) -> str:
+    if value is None:
+        return "—"
+    return f"{value:,.0f} ₽".replace(",", " ")
+
+
+def _qty(value) -> str:
+    if value is None:
+        return "—"
+    return f"{value:,.0f}".replace(",", " ")
+
+
+def catalog(rows, total: int, query: str, offset: int, limit: int) -> str:
+    """Список товаров: то, что реально приехало из 1С."""
+    if rows:
+        items = []
+        for r in rows:
+            qty = r["qty_total"]
+            qty_cls = ' class="qty zero"' if (qty or 0) <= 0 else ' class="qty"'
+            art = f'<span class="art">{html.escape(r["article"])}</span>' if r["article"] else ""
+            items.append(
+                f'<div class="item">'
+                f'<div><a href="/catalog/{html.escape(r["ident"])}">{html.escape(r["name"] or r["ident"])}</a>{art}</div>'
+                f'<span class="price">{_money(r["price_min"])}</span>'
+                f'<span{qty_cls}>{_qty(qty)} шт</span>'
+                f'</div>'
+            )
+        body_items = f'<div class="items">{"".join(items)}</div>'
+    else:
+        body_items = '<div class="panel"><p class="muted" style="margin:0">Ничего не найдено.</p></div>'
+
+    pager = []
+    q = f"&q={urllib.parse.quote(query)}" if query else ""
+    if offset > 0:
+        pager.append(f'<a href="/catalog?offset={max(0, offset - limit)}{q}">← назад</a>')
+    if offset + limit < total:
+        pager.append(f'<a href="/catalog?offset={offset + limit}{q}">вперёд →</a>')
+    shown = f"{offset + 1}–{min(offset + limit, total)} из {total}" if total else "0"
+    pager.append(f'<span class="muted">{shown}</span>')
+
+    body = f"""
+<header>
+  <h1>Каталог из 1С</h1>
+  <p class="lead">То, что реально приехало обменом: названия, артикулы, минимальная цена
+  и суммарный остаток по складам. Нулевой остаток подсвечен — именно такие позиции
+  обычно и висят на сайте как живые.</p>
+</header>
+
+<form class="search" method="get" action="/catalog">
+  <input type="search" name="q" value="{html.escape(query)}" placeholder="Название или артикул" autofocus>
+  <button type="submit">Найти</button>
+</form>
+
+{body_items}
+<div class="pager">{" ".join(pager)}</div>
+
+<nav><a href="/">← На главную</a><a href="/report">Сверка каталога</a></nav>
+<footer>Павел Чертинов · <a href="https://mvp-code.ru">mvp-code.ru</a></footer>
+"""
+    return _page("Каталог из 1С", body)
+
+
+def product(row, offers, stock, group_names) -> str:
+    """Карточка позиции: свойства из 1С, предложения, остатки по складам."""
+    by_offer: dict[str, list] = {}
+    for s in stock:
+        by_offer.setdefault(s["offer_ident"], []).append(s)
+
+    if offers:
+        parts = []
+        for o in offers:
+            feats = ""
+            if o["features"]:
+                chips = "".join(
+                    f'<span class="tag">{html.escape(line)}</span>'
+                    for line in o["features"].split("\n") if line.strip()
+                )
+                feats = f'<div class="tags">{chips}</div>'
+            wh = by_offer.get(o["ident"], [])
+            wh_html = "".join(
+                f'<tr><td class="muted">склад {html.escape(w["warehouse"][:8])}…</td>'
+                f'<td>{_qty(w["quantity"])} шт</td></tr>'
+                for w in wh
+            )
+            parts.append(
+                f'<div class="panel">'
+                f'<b>{html.escape(o["name"] or o["ident"])}</b>{feats}'
+                f'<table class="rows" style="margin-top:10px">'
+                f'<tr><td>Цена</td><td>{_money(o["price"])} {html.escape(o["currency"] or "")}</td></tr>'
+                f'<tr><td>Остаток всего</td><td>{_qty(o["quantity"])} шт</td></tr>'
+                f'{wh_html}</table></div>'
+            )
+        offers_html = "".join(parts)
+    else:
+        offers_html = ('<div class="panel"><p class="muted" style="margin:0">'
+                       'Предложений нет — значит не приехали цена и остаток, '
+                       'продавать эту позицию нечем.</p></div>')
+
+    props_rows = ""
+    if row["props"]:
+        for line in row["props"].split("\n"):
+            if "=" in line:
+                k, _, v = line.partition("=")
+                props_rows += f'<tr><td>{html.escape(k)}</td><td>{html.escape(v)}</td></tr>'
+    props_html = (f'<div class="panel"><table class="rows">{props_rows}</table></div>'
+                  if props_rows else "")
+
+    images = [i for i in (row["images"] or "").split("\n") if i.strip()]
+    img_html = ""
+    if images:
+        chips = "".join(f'<span class="tag">{html.escape(i)}</span>' for i in images)
+        img_html = f'<h2>Файлы изображений</h2><div class="panel"><div class="tags">{chips}</div></div>'
+
+    groups_html = ""
+    if group_names:
+        chips = "".join(f'<span class="tag">{html.escape(g)}</span>' for g in group_names)
+        groups_html = f'<div class="tags" style="margin-top:10px">{chips}</div>'
+
+    body = f"""
+<header>
+  <h1>{html.escape(row["name"] or row["ident"])}</h1>
+  <p class="lead mono">{html.escape(row["article"] or "без артикула")}</p>
+  {groups_html}
+</header>
+
+<h2>Предложения и остатки</h2>
+{offers_html}
+
+{"<h2>Свойства из 1С</h2>" + props_html if props_html else ""}
+{img_html}
+
+<nav><a href="/catalog">← К каталогу</a><a href="/report">Сверка</a></nav>
+<footer>Павел Чертинов · <a href="https://mvp-code.ru">mvp-code.ru</a></footer>
+"""
+    return _page(row["name"] or "Позиция", body)

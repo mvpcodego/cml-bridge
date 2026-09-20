@@ -187,6 +187,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/report":
             page = web.report(reconcile.build(ex.store))
             return self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
+        if path == "/catalog":
+            query = params.get("q", "")
+            limit = 50
+            try:
+                offset = max(0, int(params.get("offset", "0")))
+            except ValueError:
+                offset = 0
+            rows, total = ex.store.search_products(query, limit, offset)
+            page = web.catalog(rows, total, query, offset, limit)
+            return self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
+        if path.startswith("/catalog/"):
+            ident = urllib.parse.unquote(path[len("/catalog/"):])
+            row, offers, stock = ex.store.product(ident)
+            if row is None:
+                return self._send("failure\nПозиция не найдена", 404)
+            groups = ex.store.group_names([g for g in (row["groups"] or "").split(",") if g])
+            page = web.product(row, offers, stock, groups)
+            return self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
         if path == "/report.txt":
             return self._send(reconcile.render_text(reconcile.build(ex.store)))
 
@@ -220,8 +238,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         Без этого обработчика базовый класс отвечает 501, и снаружи сервис
         выглядит нерабочим при живом GET."""
         path = urllib.parse.urlparse(self.path).path
-        status = 200 if path in ("/", "/health", "/report", "/report.txt", "/exchange",
-                                 "/bitrix/admin/1c_exchange.php") else 404
+        status = 200 if (path in ("/", "/health", "/report", "/report.txt", "/catalog",
+                                  "/exchange", "/bitrix/admin/1c_exchange.php")
+                         or path.startswith("/catalog/")) else 404
         self.send_response(status)
         self.send_header("Content-Type", f"text/plain; charset={RESPONSE_ENCODING}")
         self.send_header("Content-Length", "0")
