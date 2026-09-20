@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import http.server
+import time
 import os
 import secrets
 import urllib.parse
@@ -177,6 +178,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         params = self._params()
 
+        if path == "/":
+            return self._send_bytes(_index_page(ex).encode("utf-8"), "text/html; charset=utf-8")
         if path == "/health":
             return self._send("ok")
         if path == "/report":
@@ -241,6 +244,73 @@ class Handler(http.server.BaseHTTPRequestHandler):
         first = not os.path.exists(ex._spool_path(filename))
         return self._send(ex.handle_file(filename, chunk, first))
 
+
+def _index_page(ex: "Exchange") -> str:
+    """Страница на корне: что это, куда указывать 1С, где смотреть сверку."""
+    counts = ex.store.counts()
+    last = ex.store.last_session("catalog")
+    if last is not None:
+        when = time.strftime("%d.%m.%Y %H:%M", time.localtime(last["started_at"]))
+        files = last["files"] or "—"
+        last_line = (
+            f"{when} · файлы: {files} · товаров {last['products']} · "
+            f"предложений {last['offers']} · {last['status']}"
+        )
+    else:
+        last_line = "обменов ещё не было"
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Мост 1С</title>
+<style>
+ :root {{ color-scheme: light dark; }}
+ body {{ max-width: 720px; margin: 0 auto; padding: 32px 20px 64px;
+        font: 16px/1.6 -apple-system, "Segoe UI", Roboto, sans-serif; }}
+ h1 {{ font-size: 1.5rem; margin: 0 0 4px; }}
+ .sub {{ opacity: .7; margin: 0 0 28px; }}
+ .card {{ border: 1px solid rgba(128,128,128,.3); border-radius: 10px;
+          padding: 16px 18px; margin: 0 0 16px; }}
+ code {{ background: rgba(128,128,128,.14); padding: 2px 6px; border-radius: 4px;
+         font-size: .92em; word-break: break-all; }}
+ table {{ border-collapse: collapse; width: 100%; }}
+ td {{ padding: 4px 0; }} td:last-child {{ text-align: right; font-variant-numeric: tabular-nums; }}
+ a {{ color: inherit; }}
+</style></head><body>
+<h1>Мост 1С ↔ каталог</h1>
+<p class="sub">Приём обмена CommerceML 2, сверка каталога, выгрузка заказов обратно в 1С.</p>
+
+<div class="card">
+<b>Адрес для 1С</b><br>
+<code>https://1c.mvp-code.ru/exchange</code><br>
+Работает и привычный для 1С путь <code>/bitrix/admin/1c_exchange.php</code>.<br>
+Доступ выдаётся отдельно (базовая авторизация).
+</div>
+
+<div class="card">
+<b>Состояние</b>
+<table>
+<tr><td>групп</td><td>{counts.get('groups', 0)}</td></tr>
+<tr><td>товаров</td><td>{counts.get('products', 0)}</td></tr>
+<tr><td>предложений</td><td>{counts.get('offers', 0)}</td></tr>
+<tr><td>записей об остатках</td><td>{counts.get('stock', 0)}</td></tr>
+<tr><td>обменов</td><td>{counts.get('sessions', 0)}</td></tr>
+</table>
+<p style="margin:10px 0 0">Последний обмен: {last_line}</p>
+</div>
+
+<div class="card">
+<b>Сверка каталога</b> — <a href="/report">/report</a><br>
+Отвечает на вопрос, которого нет в отчёте «обмен прошёл успешно»: что перестало
+приходить из 1С, у чего нет цены, остатка или фотографий, где один артикул у разных
+позиций, какие предложения остались без товара.
+</div>
+
+<div class="card">
+Исходный код и разбор граблей обмена:
+<a href="https://github.com/mvpcodego/cml-bridge">github.com/mvpcodego/cml-bridge</a><br>
+Автор: Павел Чертинов, <a href="https://mvp-code.ru">mvp-code.ru</a>
+</div>
+</body></html>"""
 
 def serve(store: store_mod.Store, login: str, password: str, host: str = "0.0.0.0",
           port: int = 8021, spool: str = "spool") -> None:
