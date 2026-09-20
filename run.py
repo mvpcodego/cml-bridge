@@ -36,7 +36,8 @@ def main(argv: list[str]) -> int:
     store = store_mod.Store(DB)
 
     if command == "serve":
-        exchange.serve(store, LOGIN, PASSWORD, port=PORT)
+        spool = os.environ.get("CML_SPOOL", "spool")
+        exchange.serve(store, LOGIN, PASSWORD, port=PORT, spool=spool)
         return 0
 
     if command == "import":

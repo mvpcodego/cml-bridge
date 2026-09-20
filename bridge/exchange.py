@@ -208,6 +208,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send("success")
         return self._send(f"failure\nНеизвестный режим {mode}")
 
+    def do_HEAD(self) -> None:
+        """Мониторинг и прокси часто проверяют доступность именно HEAD-запросом.
+        Без этого обработчика базовый класс отвечает 501, и снаружи сервис
+        выглядит нерабочим при живом GET."""
+        path = urllib.parse.urlparse(self.path).path
+        status = 200 if path in ("/health", "/report", "/exchange",
+                                 "/bitrix/admin/1c_exchange.php") else 404
+        self.send_response(status)
+        self.send_header("Content-Type", f"text/plain; charset={RESPONSE_ENCODING}")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self) -> None:
         ex = self.exchange
         assert ex is not None
